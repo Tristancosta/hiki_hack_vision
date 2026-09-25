@@ -1,4 +1,3 @@
-using System.Globalization;
 using HikiHackVision.Infra;
 using HikiHackVision.Menu;
 
@@ -70,9 +69,7 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
             {
                 var s = await video.OffsetForElapsedAsync(cs.Start, span.Value);
                 var e = await video.OffsetForElapsedAsync(cs.End, span.Value);
-                // Com -c copy o corte começa num keyframe; usa o primeiro keyframe >= início
-                // para não incluir nada de antes das 06:00 (nem de um evento anterior ao salto)
-                if (s > 0.05) s = keyframes.FirstOrDefault(k => k >= s - 0.001, double.MaxValue);
+                s = ClipCutter.SnapToKeyframe(s, keyframes);
                 if (e - s >= 1) fileSegments.Add(new Segment(s, e));
             }
 
@@ -100,11 +97,7 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
                     : $"{Path.GetFileNameWithoutExtension(name)}_parte{s + 1}{Path.GetExtension(name)}";
                 var output = Path.Combine(outDir, outName);
 
-                // Início levemente após o keyframe: o seek de entrada volta para o keyframe exato
-                var ss = seg.Start > 0 ? seg.Start + 0.01 : 0;
-                var r = await ffmpeg.FfmpegAsync("-y",
-                    "-ss", Fmt(ss), "-to", Fmt(seg.End), "-i", input,
-                    "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero", output);
+                var r = await ClipCutter.CutAsync(ffmpeg, input, seg, output);
 
                 if (!r.Success)
                 {
@@ -130,77 +123,8 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
         ConsoleUi.Info($"Saída: {outDir}");
     }
 
-    private static string Fmt(double seconds) => seconds.ToString("0.###", CultureInfo.InvariantCulture);
-
     private static string Describe(ClockReference start, double elapsed, bool timeOnly = false) =>
         start.StartDateTime is { } dt && !timeOnly
             ? dt.AddSeconds(elapsed).ToString("dd/MM HH:mm:ss")
             : CutWindowCalculator.ClockAt(start.StartClock, elapsed).ToString("HH:mm:ss");
-
-    /// <summary>
-    /// Relaciona a posição no arquivo com o relógio gravado na imagem. Nas gravações por evento do NVR
-    /// o relógio não anda 1:1 com o arquivo (saltos entre eventos, FPS variável), então a única
-    /// premissa é que ele nunca volta: os limites de corte são achados por busca binária no OSD.
-    /// </summary>
-    private sealed class VideoClock(OsdTimestampReader reader, ClockReference start, double duration)
-    {
-        private double _span = double.MaxValue;
-
-        /// <summary>Segundos de relógio decorridos entre o início e o fim do arquivo; null se o fim for ilegível.</summary>
-        public async Task<double?> ReadClockSpanAsync()
-        {
-            foreach (var back in new[] { 1.0, 5.0, 15.0, 40.0 })
-            {
-                var t = duration - back;
-                if (t <= 0) break;
-                var sample = await reader.ReadAtAsync(t);
-                if (sample == null) continue;
-                var e = start.Elapsed(sample.Reading);
-                if (e < 0) continue; // leitura incoerente (relógio não volta)
-                _span = e;
-                return e;
-            }
-            return null;
-        }
-
-        /// <summary>Resolução da busca: menor que o intervalo entre quadros, para achar o quadro exato do limite.</summary>
-        private const double Resolution = 0.02;
-
-        /// <summary>
-        /// Posição t tal que todo quadro com pts &lt; t está antes de <paramref name="targetElapsed"/> e todo quadro
-        /// com pts ≥ t já o atingiu. Serve direto como fim (-to) e, ajustado ao keyframe seguinte, como início.
-        /// Em gravações por evento o relógio pode andar dezenas de vezes mais rápido que o arquivo,
-        /// por isso a busca vai até a resolução de um quadro.
-        /// </summary>
-        public async Task<double> OffsetForElapsedAsync(double targetElapsed, double span)
-        {
-            if (targetElapsed <= 0) return 0;
-            if (targetElapsed >= span) return duration;
-
-            double lo = 0, hi = duration;
-            while (hi - lo > Resolution)
-            {
-                var probe = await ProbeBetweenAsync(lo, hi);
-                if (probe == null) break; // OSD ilegível nessa região: fica com o limite seguro (hi)
-
-                if (probe.Value.Elapsed >= targetElapsed) hi = probe.Value.Offset;
-                else lo = probe.Value.Offset;
-            }
-            return hi;
-        }
-
-        /// <summary>Lê o quadro no meio de (lo, hi); se ilegível, tenta outros pontos do intervalo.</summary>
-        private async Task<(double Offset, double Elapsed)?> ProbeBetweenAsync(double lo, double hi)
-        {
-            foreach (var frac in new[] { 0.5, 0.3, 0.7, 0.15, 0.85 })
-            {
-                var t = lo + (hi - lo) * frac;
-                var sample = await reader.ReadAtAsync(t, exact: true);
-                if (sample == null) continue;
-                var e = start.Elapsed(sample.Reading);
-                if (e >= -2 && e <= _span + 2) return (t, e); // fora disso: leitura incoerente
-            }
-            return null;
-        }
-    }
 }
