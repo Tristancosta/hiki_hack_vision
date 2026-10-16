@@ -16,6 +16,8 @@ public static class ConsoleUi
         Console.WriteLine("   lendo o horário gravado na imagem (canto superior esquerdo).");
         Console.WriteLine(" - Normatiza os dias: corta os vídeos em períodos de 15 minutos,");
         Console.WriteLine("   nomeados ddMMhhmm_x (x = número do dia na contagem).");
+        Console.WriteLine(" - Processo completo: faz as três etapas em sequência e guarda");
+        Console.WriteLine("   só o resultado final, na pasta 'prontos'.");
         Console.WriteLine();
     }
 
@@ -28,6 +30,7 @@ public static class ConsoleUi
         Console.WriteLine(" 1) Converter vídeos para MP4");
         Console.WriteLine(" 2) Cortar vídeos (manter 06h às 18h)");
         Console.WriteLine(" 3) Normatizar dias (períodos de 15 min, ddMMhhmm_x)");
+        Console.WriteLine(" 4) Processo completo (converter → cortar → normatizar)");
         Console.WriteLine(" 0) Sair");
         Console.Write("O que deseja fazer? ");
         return (Console.ReadLine() ?? "0").Trim();

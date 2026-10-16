@@ -11,11 +11,16 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
         var folder = ConsoleUi.AskFolder("Cole o caminho da pasta com os vídeos");
         if (folder == null) return;
 
+        await CutFolderAsync(folder, ProjectPaths.EnsureDir(root, "cortados"));
+    }
+
+    /// <summary>Corta os vídeos de <paramref name="folder"/> para <paramref name="outDir"/> (já existente).</summary>
+    public async Task CutFolderAsync(string folder, string outDir)
+    {
         var files = ProjectPaths.ListVideos(folder);
         ConsoleUi.Info($"Encontrados {files.Count} vídeo(s).");
         if (files.Count == 0) return;
 
-        var outDir = ProjectPaths.EnsureDir(root, "cortados");
         int cut = 0, copied = 0;
         var discarded = new List<string>();
         var errors = new List<(string Name, string Error)>();

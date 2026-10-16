@@ -14,11 +14,16 @@ public class VideoConverter(FfmpegTools ffmpeg, string root)
         var folder = ConsoleUi.AskFolder("Cole o caminho da pasta com os vídeos");
         if (folder == null) return;
 
+        await ConvertFolderAsync(folder, ProjectPaths.EnsureDir(root, "convertidos"));
+    }
+
+    /// <summary>Converte os vídeos de <paramref name="folder"/> para <paramref name="outDir"/> (já existente).</summary>
+    public async Task ConvertFolderAsync(string folder, string outDir)
+    {
         var files = ProjectPaths.ListVideos(folder);
         ConsoleUi.Info($"Encontrados {files.Count} vídeo(s).");
         if (files.Count == 0) return;
 
-        var outDir = ProjectPaths.EnsureDir(root, "convertidos");
         var tempDir = Path.Combine(Path.GetTempPath(), "hiki_convert");
         Directory.CreateDirectory(tempDir);
         var failures = new List<(string Name, string Error)>();

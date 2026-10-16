@@ -7,6 +7,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>HikiHackVision</RootNamespace>
     <AssemblyName>HikiHackVision</AssemblyName>
+    <Version>1.0.0</Version>
   </PropertyGroup>
 
 </Project>

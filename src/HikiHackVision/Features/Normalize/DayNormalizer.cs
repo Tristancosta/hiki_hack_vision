@@ -26,11 +26,16 @@ public class DayNormalizer(FfmpegTools ffmpeg, string root)
         var folder = ConsoleUi.AskFolder("Cole o caminho da pasta com os vídeos (normalmente a pasta 'cortados')");
         if (folder == null) return;
 
+        await NormalizeFolderAsync(folder, ProjectPaths.EnsureDir(root, "normatizados"));
+    }
+
+    /// <summary>Normatiza os vídeos de <paramref name="folder"/> em <paramref name="outDir"/> (já existente).</summary>
+    public async Task NormalizeFolderAsync(string folder, string outDir)
+    {
         var files = ProjectPaths.ListVideos(folder);
         ConsoleUi.Info($"Encontrados {files.Count} vídeo(s).");
         if (files.Count == 0) return;
 
-        var outDir = ProjectPaths.EnsureDir(root, "normatizados");
         var tempDir = Path.Combine(outDir, "_tmp");
         Directory.CreateDirectory(tempDir);
 

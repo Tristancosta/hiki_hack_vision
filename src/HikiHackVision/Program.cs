@@ -2,6 +2,7 @@ using System.Text;
 using HikiHackVision.Features.Convert;
 using HikiHackVision.Features.Cut;
 using HikiHackVision.Features.Normalize;
+using HikiHackVision.Features.Pipeline;
 using HikiHackVision.Infra;
 using HikiHackVision.Menu;
 
@@ -40,6 +41,9 @@ while (true)
             break;
         case "3":
             await new DayNormalizer(ffmpeg, root).RunAsync();
+            break;
+        case "4":
+            await new FullPipeline(ffmpeg, root).RunAsync();
             break;
         case "0":
             return 0;

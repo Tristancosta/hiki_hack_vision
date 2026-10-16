@@ -7,13 +7,16 @@ HikiHackVision is a Windows console app (C# / .NET 10, UI text in Portuguese) wi
 1. **Convert** Hikvision `.mp4` files to standard MP4, written to `<root>/convertidos/`.
 2. **Cut** videos so that only footage between 06:00 and 18:00 is kept, written to `<root>/cortados/` under the original file name. A file that yields several segments (for example, one that runs across the night) gets `_parte1`, `_parte2`, … suffixes. Files that fall completely outside the window are discarded.
 3. **Normalize days** (`Normatizar dias`): splits the footage into 15-minute clock periods within 06:00–18:00 and writes each period to `<root>/normatizados/` as `ddMMhhmm_x.mp4`. `ddMM` is the date, `hhmm` the period start (0600, 0615, …, 1745) and `x` the day's ordinal across the run (1 for the earliest date, 2 for the next, …). Pieces from different files that fall in the same period are concatenated in clock order.
+4. **Full process** (`Processo completo`): runs 1 → 2 → 3 on a source folder, each step reading the previous step's output. Only the final result is kept, in `<root>/prontos/`. The intermediate videos are temporary.
 
 ## Commands
 ```
 dotnet build
 dotnet run --project src/HikiHackVision
 dotnet publish src/HikiHackVision -c Release -o publish
+powershell -ExecutionPolicy Bypass -File installer/build.ps1   # → dist/HikiHackVision-Setup-<version>.exe
 ```
+- The installer needs Inno Setup 6 (`winget install JRSoftware.InnoSetup`). Its version comes from `<Version>` in the csproj; bump it before generating a new release.
 - There are no unit tests, by the user's choice. Verify changes by running the app against sample videos.
 - To generate a sample, draw a clock in the top-left corner: `tools/ffmpeg -f lavfi -i testsrc=size=1280x720:rate=15:duration=180 -vf "drawtext=fontfile='C\:/Windows/Fonts/arial.ttf':text='%{pts\:gmtime\:<unix epoch>\:%m-%d-%Y %a %T}':x=16:y=16:fontsize=40:fontcolor=white:borderw=2:bordercolor=black" -c:v libx264 -g 15 out.mp4`. Use `%T`, because escaped colons inside drawtext strftime don't parse.
 - Set `HIKI_OCR_DEBUG=1` to print every OSD reading (offset → date/time and match distance).
@@ -24,7 +27,8 @@ dotnet publish src/HikiHackVision -c Release -o publish
   - `FfmpegLocator` looks for `tools/ffmpeg.exe` and `tools/ffprobe.exe`, then checks PATH. If neither has them, it downloads the gyan.dev essentials zip.
   - All ffmpeg and ffprobe calls go through `FfmpegTools`, which wraps `ProcessRunner` using `ArgumentList` (no shell quoting). Frames for OSD reading come back as raw gray bytes (`ExtractGrayCornerAsync`, `-f rawvideo`), not as image files.
   - There are no NuGet dependencies.
-- **Root folder:** `ProjectPaths.FindRoot` walks up from the exe's folder to the folder containing `HikiHackVision.sln*`. If there isn't one, it falls back to the exe's folder. The `tools/`, `convertidos/` and `cortados/` folders are created relative to this root.
+- **Root folder:** `ProjectPaths.FindRoot` walks up from the exe's folder to the folder containing `HikiHackVision.sln*`. If there isn't one, it falls back to the exe's folder. The `tools/`, `convertidos/`, `cortados/`, `normatizados/` and `prontos/` folders are created relative to this root.
+- **Feature entry points:** each feature's `RunAsync` only asks for the input folder and passes `<root>/<output>` to its `ConvertFolderAsync` / `CutFolderAsync` / `NormalizeFolderAsync(folder, outDir)`. Those methods take any input/output folder pair, which is what the full process uses.
 - **Conversion (`VideoConverter`):** `FfmpegTools.ProbeAsync` picks the path. Empty (pre-allocated) blocks are skipped by `ListVideos`, and outputs that already exist are skipped too.
   - **NVR blocks (`hivXXXXX.mp4`):** these are really MPEG Program Streams (format `mpeg`) carrying H.265 or H.264. A direct remux produces a broken timeline, so the converter does two things. It first extracts the raw elementary stream (`-f hevc`/`h264`) into `%TEMP%/hiki_convert`. It then remuxes that into MP4 with `-r <fps>` (probed `r_frame_rate`, falling back to 10) and `-c copy`. Audio is dropped.
   - **Real MP4s:** stream-copy the video and re-encode the audio to AAC. Hikvision audio is G.711, which MP4 doesn't accept. If that fails, fall back to libx264.
@@ -48,3 +52,9 @@ dotnet publish src/HikiHackVision -c Release -o publish
      - The result `hi` is the first position whose frames are already ≥ the boundary. That makes it an exact `-to` for segment ends.
   5. Cuts use `-c copy`. Segment starts snap to the **first keyframe ≥ the boundary** (`GetKeyframesAsync` parses packet flags), so no footage from before 06:00, or from an event before a gap, leaks in. `-ss` is passed as keyframe + 0.01 because input seeking lands on the keyframe at or before it.
 - **Day normalization (`Features/Normalize/DayNormalizer`):** same OSD pipeline as the cut, reusing `VideoClock` (binary search) and `ClipCutter` (keyframe snap + `-c copy` cut), both shared with `VideoCutter`. `CalculateSlots` lists the 15-minute periods covered by [start, start + span] inside 06:00–18:00. Each file is cut per period into `normatizados/_tmp/`, then periods are assembled: one piece is moved, several are joined with the ffmpeg concat demuxer (`-f concat -safe 0 -c copy`). Period starts snap to the first keyframe ≥ the boundary, so a few seconds of clock may be missing at the start of each period; ends are exact. If the date is unreadable at the start (bright background), `FindStartDateAsync` reads later frames and subtracts the elapsed clock. Existing outputs with the same name are overwritten, leftovers from earlier runs are not deleted.
+- **Full process (`Features/Pipeline/FullPipeline`):** calls the three folder methods in sequence. The intermediate outputs go to `%TEMP%/hiki_completo/{convertidos,cortados}`. That folder is cleared at the start (leftovers from an interrupted run) and deleted at the end, and `convertidos` is deleted as soon as the cut finishes to free disk space. The normalization writes straight to `<root>/prontos/`. If a step yields no videos, the process stops.
+- **Installer (`installer/`):**
+  - `build.ps1` publishes a self-contained single-file `win-x64` exe into `publish/win-x64` (target PCs need no .NET), then runs `ISCC` on `HikiHackVision.iss`. If `tools/ffmpeg.exe` and `tools/ffprobe.exe` exist, they are bundled; otherwise the app downloads them on first run.
+  - The setup installs per-user, with no admin prompt, to `C:\HikiHackVision` by default; the user can pick another folder. With no `.sln` above it, that folder becomes the app's root, so all output folders live there. This is why the default avoids Program Files (not writable) and Documents (often synced to OneDrive).
+  - Uninstalling removes only installed files, so generated videos stay. Keep the `AppId` GUID fixed, so that a newer setup upgrades the existing install in place.
+  - Both scripts are saved as UTF-8 **with BOM**: Windows PowerShell 5.1 reads BOM-less files as ANSI.
