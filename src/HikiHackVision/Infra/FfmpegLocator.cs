@@ -65,6 +65,46 @@ public record FfmpegTools(string Ffmpeg, string Ffprobe)
         return result;
     }
 
+    /// <summary>
+    /// FPS real da câmera medido pelos intervalos entre pacotes (sem decodificar). O NVR mistura quadros a
+    /// 0,1s (movimento) com quadros a cada 1-2s (sem movimento), e o r_frame_rate do cabeçalho não reflete
+    /// nenhum dos dois (visto 1 e 30 para câmeras a 10 fps). Usa a mediana dos intervalos curtos (&lt; 0,5s).
+    /// </summary>
+    public async Task<double?> MeasureFrameRateAsync(string file)
+    {
+        var r = await ProcessRunner.RunAsync(Ffprobe,
+            ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", file]);
+        var times = r.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(l => double.TryParse(l.Split(',')[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var t) ? t : double.NaN)
+            .Where(t => !double.IsNaN(t))
+            .ToList();
+        var gaps = times.Zip(times.Skip(1), (a, b) => b - a).Where(d => d is > 0.01 and < 0.5).Order().ToList();
+        if (gaps.Count < 50) return null;
+        var fps = Math.Round(1 / gaps[gaps.Count / 2]);
+        return fps is >= 1 and <= 60 ? fps : null;
+    }
+
+    /// <summary>
+    /// Trechos de resolução constante: início (s) de cada mudança de largura/altura, lida só dos keyframes
+    /// (a resolução só muda num keyframe, com novos parâmetros do codec).
+    /// </summary>
+    public async Task<List<(double Start, int Width, int Height)>> GetResolutionRunsAsync(string file)
+    {
+        var r = await ProcessRunner.RunAsync(Ffprobe,
+            ["-v", "error", "-skip_frame", "nokey", "-select_streams", "v:0",
+             "-show_entries", "frame=pts_time,width,height", "-of", "csv=p=0", file]);
+        var runs = new List<(double Start, int Width, int Height)>();
+        foreach (var line in r.StdOut.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var p = line.Split(',');
+            if (p.Length < 3
+                || !double.TryParse(p[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var t)
+                || !int.TryParse(p[1], out var w) || !int.TryParse(p[2], out var h)) continue;
+            if (runs.Count == 0 || runs[^1].Width != w || runs[^1].Height != h) runs.Add((t, w, h));
+        }
+        return runs;
+    }
+
     /// <summary>Um quadro na posição indicada, recortado no canto superior esquerdo, em cinza (1 byte/pixel).</summary>
     public Task<byte[]?> ExtractGrayCornerAsync(string file, double seconds, int width, int height) =>
         ProcessRunner.RunBinaryAsync(Ffmpeg,

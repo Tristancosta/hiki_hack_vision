@@ -164,8 +164,9 @@ public class DayNormalizer(FfmpegTools ffmpeg, string root)
             return;
         }
 
-        var startDt = start.StartDateTime ?? await FindStartDateAsync(reader, start, duration.Value);
-        if (startDt is not { } startDateTime)
+        // Se a data não for legível no início (fundo claro), a varredura do VideoClock a deriva de uma
+        // leitura datada mais adiante, descontando o relógio decorrido (que nunca volta)
+        if (video.StartDateTime is not { } startDateTime)
         {
             ConsoleUi.Error("data não lida");
             errors.Add((name, "data não lida na imagem (OSD); sem ela não dá para saber o dia"));
@@ -243,25 +244,6 @@ public class DayNormalizer(FfmpegTools ffmpeg, string root)
                 result.Add((slot, new Segment((s - start).TotalSeconds, (e - start).TotalSeconds)));
         }
         return result;
-    }
-
-    /// <summary>
-    /// Quando a data não é legível no início (fundo claro, por exemplo), procura uma leitura com data
-    /// mais adiante no arquivo e deriva a data inicial descontando o relógio decorrido (que nunca volta).
-    /// </summary>
-    private static async Task<DateTime?> FindStartDateAsync(OsdTimestampReader reader, ClockReference start, double duration)
-    {
-        foreach (var t in new[] { 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, duration * 0.5, duration * 0.75, duration - 5 })
-        {
-            if (t <= 0 || t >= duration) continue;
-            var sample = await reader.ReadAtAsync(t);
-            if (sample?.Reading.Date is not { } date) continue;
-
-            var elapsed = start.Elapsed(sample.Reading);
-            if (elapsed < 0) continue; // leitura incoerente
-            return date.ToDateTime(sample.Reading.Time).AddSeconds(-elapsed);
-        }
-        return null;
     }
 
     /// <summary>

@@ -38,7 +38,7 @@ public class VideoConverter(FfmpegTools ffmpeg, string root)
                 var output = Path.Combine(outDir, Path.GetFileNameWithoutExtension(input) + ".mp4");
                 ConsoleUi.Progress(i + 1, files.Count, name);
 
-                if (File.Exists(output) && new FileInfo(output).Length > 1024)
+                if (IsDone(output) || IsDone(PartPath(output, 1)))
                 {
                     ConsoleUi.Warn("já convertido, pulando");
                     skipped++;
@@ -46,13 +46,23 @@ public class VideoConverter(FfmpegTools ffmpeg, string root)
                 }
 
                 var probe = await ffmpeg.ProbeAsync(input);
-                var r = IsProgramStream(probe) && ElementaryFormat(probe!.VideoCodec) is { } esFormat
-                    ? await RemuxElementaryStreamAsync(input, output, esFormat, FrameRateOf(probe), tempDir)
+                var isPs = IsProgramStream(probe) && ElementaryFormat(probe!.VideoCodec) != null;
+                var fps = isPs ? await ffmpeg.MeasureFrameRateAsync(input) ?? FrameRateOf(probe!) : 0;
+                var r = isPs
+                    ? await RemuxElementaryStreamAsync(input, output, ElementaryFormat(probe!.VideoCodec)!, fps, tempDir)
                     : await ConvertMp4Async(input, output);
+
+                if (IsValidOutput(r, output) && isPs)
+                    r = await SplitByResolutionAsync(output, ElementaryFormat(probe!.VideoCodec)!, fps, tempDir);
 
                 if (IsValidOutput(r, output))
                 {
                     ConsoleUi.Ok($"OK ({new FileInfo(output).Length / (1024 * 1024)} MB)");
+                }
+                else if (r.Success && IsDone(PartPath(output, 1)))
+                {
+                    var parts = Enumerable.Range(1, 99).Select(n => PartPath(output, n)).TakeWhile(File.Exists).ToList();
+                    ConsoleUi.Ok($"OK em {parts.Count} partes ({parts.Sum(p => new FileInfo(p).Length) / (1024 * 1024)} MB)");
                 }
                 else
                 {
@@ -100,6 +110,60 @@ public class VideoConverter(FfmpegTools ffmpeg, string root)
             if (File.Exists(raw)) File.Delete(raw);
         }
     }
+
+    /// <summary>
+    /// O NVR pode trocar de resolução no meio de um bloco (ex.: 2560x1440 → 1280x720). Num único MP4 o cabeçalho
+    /// fica com a 1ª resolução e os quadros seguintes são mal interpretados (cortes quebrados, OSD fora do lugar).
+    /// Nesse caso divide em <c>nome_1.mp4</c>, <c>nome_2.mp4</c>, … um por resolução, e apaga o MP4 misto.
+    /// Cada parte é re-extraída como stream cru e remontada, para o cabeçalho refletir a sua própria resolução.
+    /// </summary>
+    private async Task<ProcessResult> SplitByResolutionAsync(string output, string esFormat, double frameRate, string tempDir)
+    {
+        var runs = await ffmpeg.GetResolutionRunsAsync(output);
+        if (runs.Count <= 1) return new ProcessResult(0, "", "");
+
+        Console.Write($"{runs.Count} resoluções ({string.Join(" → ", runs.Select(x => $"{x.Width}x{x.Height}"))}), dividindo ... ");
+        var fps = frameRate.ToString(CultureInfo.InvariantCulture);
+        for (var k = 0; k < runs.Count; k++)
+        {
+            var part = PartPath(output, k + 1);
+            var raw = Path.Combine(tempDir, $"part{k + 1}.{esFormat}");
+            try
+            {
+                // Cada trecho começa num keyframe: +0,01 garante que a busca caia nele e não no anterior
+                List<string> args = ["-y"];
+                if (k > 0) args.AddRange(["-ss", (runs[k].Start + 0.01).ToString("0.###", CultureInfo.InvariantCulture)]);
+                if (k + 1 < runs.Count) args.AddRange(["-to", runs[k + 1].Start.ToString("0.###", CultureInfo.InvariantCulture)]);
+                args.AddRange(["-i", output, "-map", "0:v:0", "-c", "copy", "-f", esFormat, raw]);
+
+                // Blocos do NVR costumam terminar num pacote truncado: o ffmpeg grava todo o resto mas sai com erro
+                // ("Invalid data found when processing input"). Isso descartava o hiv00013 inteiro (22/09 até 09:53).
+                // Com o stream extraído, segue; o remux abaixo é que valida a parte.
+                var r = await ffmpeg.FfmpegAsync([.. args]);
+                if (!r.Success && File.Exists(raw) && new FileInfo(raw).Length > 1024)
+                    r = new ProcessResult(0, "", "");
+                if (r.Success)
+                    r = await ffmpeg.FfmpegAsync("-y", "-r", fps, "-f", esFormat, "-i", raw, "-c", "copy",
+                        "-movflags", "+faststart", part);
+                if (!IsValidOutput(r, part))
+                {
+                    for (var j = 1; j <= k + 1; j++) File.Delete(PartPath(output, j));
+                    return r.Success ? new ProcessResult(1, "", "falha ao dividir por resolução") : r;
+                }
+            }
+            finally
+            {
+                if (File.Exists(raw)) File.Delete(raw);
+            }
+        }
+        File.Delete(output);
+        return new ProcessResult(0, "", "");
+    }
+
+    private static string PartPath(string output, int n) =>
+        Path.Combine(Path.GetDirectoryName(output)!, $"{Path.GetFileNameWithoutExtension(output)}_{n}.mp4");
+
+    private static bool IsDone(string path) => File.Exists(path) && new FileInfo(path).Length > 1024;
 
     /// <summary>Para arquivos que já são MP4: copia o vídeo e converte o áudio G.711 para AAC; se falhar, recodifica.</summary>
     private async Task<ProcessResult> ConvertMp4Async(string input, string output)

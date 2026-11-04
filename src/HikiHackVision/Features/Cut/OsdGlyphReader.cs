@@ -44,12 +44,12 @@ public static class OsdGlyphReader
             if (grid == null) continue;
 
             var count = (int)((width - grid.Origin) / grid.Pitch);
-            var cells = new Dictionary<char, int>?[count];
-            var found = Decode(i =>
+
+            var found = PickFont(font =>
             {
-                if (i < 0 || i >= count) return null;
-                return cells[i] ??= MaskScores(grid, i, mask, width, height);
-            }, 0, count - 8, MaskAccept);
+                var cells = new Dictionary<char, int>?[count];
+                return i => i < 0 || i >= count ? null : cells[i] ??= MaskScores(grid, i, mask, width, height, font);
+            }, scores => Decode(scores, 0, count - 8, MaskAccept, knownPosition: false));
             if (found != null) return (found.Value.Reading, grid with { TimeCell = found.Value.TimeCell });
         }
         return null;
@@ -58,10 +58,74 @@ public static class OsdGlyphReader
     /// <summary>Lê o OSD numa posição já conhecida (mesmo vídeo). Robusto a fundo claro.</summary>
     public static OsdReading? ReadWithLayout(byte[] gray, int width, int height, OsdLayout layout)
     {
-        var cache = new Dictionary<int, Dictionary<char, int>?>();
-        var found = Decode(i => cache.TryGetValue(i, out var s) ? s : cache[i] = ContrastScores(layout, i, gray, width, height),
-            layout.TimeCell, layout.TimeCell, ContrastAccept);
+        var found = PickFont(font =>
+        {
+            var dateLayout = layout with { Origin = layout.Origin + DateShift(layout, gray, width, height, font) };
+            var cache = new Dictionary<int, Dictionary<char, int>?>();
+            return i => cache.TryGetValue(i, out var s) ? s
+                : cache[i] = ContrastScores(IsDateCell(layout, i) ? dateLayout : layout, i, gray, width, height, font);
+        }, scores => Decode(scores, layout.TimeCell, layout.TimeCell, ContrastAccept, knownPosition: true));
         return found?.Reading;
+    }
+
+    /// <summary>Células da data (AAAA-MM-DD ou MM-DD-AAAA): as 10 que começam 15 antes da hora.</summary>
+    private static bool IsDateCell(OsdLayout g, int i) => i >= g.TimeCell - 15 && i < g.TimeCell - 5;
+
+    /// <summary>
+    /// Deslocamento (px) que melhor encaixa o bloco da data. A grade é calibrada pela hora, e um erro de
+    /// centésimos de pixel no passo vira ~1,5 px 15 células à esquerda: com o passo 16,025 medido num NVR de
+    /// 720p, os dígitos da data ficavam com distância ~13 e o "6" de "26" não abria folga sobre o "0" (a data
+    /// de 26 a 28/09 não era lida e esses dias sumiam da normatização). Um só deslocamento para o bloco inteiro,
+    /// em ±3 px (bem menos que uma célula), não deixa um dígito isolado escorregar para outro glifo.
+    /// </summary>
+    private static double DateShift(OsdLayout layout, byte[] gray, int width, int height, int font)
+    {
+        (double Dx, int Fit) best = (0, int.MaxValue);
+        for (var dx = -3.0; dx <= 3.0; dx += 0.5)
+        {
+            var g = layout with { Origin = layout.Origin + dx };
+            var fit = 0;
+            for (var i = layout.TimeCell - 15; i < layout.TimeCell - 5 && fit < best.Fit; i++)
+                fit += ContrastScores(g, i, gray, width, height, font)?.Values.Min() ?? 99;
+            // Empate: fica o menor deslocamento (o da calibração é o ponto de partida)
+            if (fit < best.Fit || (fit == best.Fit && Math.Abs(dx) < Math.Abs(best.Dx))) best = (dx, fit);
+        }
+        return best.Dx;
+    }
+
+    /// <summary>
+    /// Lê com cada variante da fonte separadamente (a mesma câmera pode alternar entre elas no mesmo arquivo).
+    /// Misturar variantes num só texto confunde glifos: o "3" fino fica quase contido no "8" cheio, e o
+    /// contraste ignora o fundo. A variante é escolhida pelo ajuste de todas as células de data e hora; só se
+    /// as duas se ajustam parecido vale a leitura em que concordam (ou a de distância bem menor).
+    /// </summary>
+    private static (OsdReading Reading, int TimeCell)? PickFont(
+        Func<int, Func<int, Dictionary<char, int>?>> scoresFor,
+        Func<Func<int, Dictionary<char, int>?>, (OsdReading Reading, int TimeCell)?> decode)
+    {
+        var sa = scoresFor(0);
+        var sb = scoresFor(1);
+        var a = decode(sa);
+        var b = decode(sb);
+        if (a == null && b == null) return null;
+
+        // Ajuste = soma da menor distância de cada célula da data (AAAA-MM-DD) e da hora (HH:MM:SS)
+        var timeCell = (a ?? b)!.Value.TimeCell;
+        int Fit(Func<int, Dictionary<char, int>?> scores) =>
+            Enumerable.Range(timeCell - 15, 10).Concat(Enumerable.Range(timeCell, 8))
+                .Sum(i => scores(i)?.Values.Min() ?? 0);
+        const int FitGap = 6;
+        int fa = Fit(sa), fb = Fit(sb);
+        if (fa + FitGap <= fb) return a;
+        if (fb + FitGap <= fa) return b;
+
+        if (a == null || b == null) return a ?? b;
+        if (a.Value.Reading.Time == b.Value.Reading.Time && a.Value.Reading.Date == b.Value.Reading.Date)
+            return a.Value.Reading.Distance <= b.Value.Reading.Distance ? a : b;
+        const int ClearGap = 8;
+        if (a.Value.Reading.Distance + ClearGap <= b.Value.Reading.Distance) return a;
+        if (b.Value.Reading.Distance + ClearGap <= a.Value.Reading.Distance) return b;
+        return null;
     }
 
     private readonly record struct Comp(int X0, int Y0, int X1, int Y1);
@@ -75,7 +139,7 @@ public static class OsdGlyphReader
     /// Cada dígito é restrito aos valores possíveis na posição (ex.: dezena da hora só 0-2).
     /// </summary>
     private static (OsdReading Reading, int TimeCell)? Decode(
-        Func<int, Dictionary<char, int>?> cellScores, int first, int last, Func<int, int, bool> accept)
+        Func<int, Dictionary<char, int>?> cellScores, int first, int last, Func<int, int, bool> accept, bool knownPosition)
     {
         int? Digit(int i, string allowed)
         {
@@ -85,15 +149,24 @@ public static class OsdGlyphReader
             var margin = ranked.Count > 1 ? ranked[1].D - ranked[0].D : 99;
             return accept(ranked[0].D, margin) ? ranked[0].C - '0' : null;
         }
-        // Separador: basta parecer mais com ele do que com qualquer dígito (a posição já é fixada pelo padrão)
-        bool Sep(int i, char c) => cellScores(i) is { } s && s[c] < Digits.Min(d => s[d]);
+        // Separador: parecer mais com ele do que com qualquer dígito e do que com o outro separador
+        // (senão a data "10-21-2026" é lida como o horário 10:21:20)
+        bool Sep(int i, char c) => cellScores(i) is { } s && s[c] < Digits.Min(d => s[d]) && s[c] < s[c == ':' ? '-' : ':'];
         int Dist(int i) => cellScores(i)!.Where(kv => char.IsDigit(kv.Key)).Min(kv => kv.Value);
+
+        // Os ":" do horário: na varredura (posição desconhecida) valem as duas exigências acima. Com a posição já
+        // fixada pelo layout basta não parecer dígito: na fonte cheia sobre céu claro, a faixa de fundo entre o
+        // contorno do glifo anterior e o do ":" (2 pixels de fonte) parece um traço nas colunas 0-1 da célula,
+        // e o ":" perde para o "-" mesmo estando lá (o OSD inteiro ficava ilegível, 26/10 09:00-10:15 sumiu)
+        bool TimeSep(int i) => knownPosition
+            ? cellScores(i) is { } s && s[':'] < Digits.Min(d => s[d])
+            : Sep(i, ':');
 
         const string Any = "0123456789", To2 = "012", To5 = "012345";
         (OsdReading Reading, int TimeCell)? best = null;
         for (var i = Math.Max(0, first); i <= last; i++)
         {
-            if (!Sep(i + 2, ':') || !Sep(i + 5, ':')) continue;
+            if (!TimeSep(i + 2) || !TimeSep(i + 5)) continue;
             if (Digit(i, To2) is not { } h1 || Digit(i + 1, Any) is not { } h2
                 || Digit(i + 3, To5) is not { } m1 || Digit(i + 4, Any) is not { } m2
                 || Digit(i + 6, To5) is not { } s1 || Digit(i + 7, Any) is not { } s2) continue;
@@ -102,17 +175,21 @@ public static class OsdGlyphReader
             if (hh > 23) continue;
             var dist = new[] { i, i + 1, i + 3, i + 4, i + 6, i + 7 }.Sum(Dist);
 
-            DateOnly? date = null;
+            // Data 15 células antes: "AAAA-MM-DD" ou, em algumas câmeras, "MM-DD-AAAA"
             var d = i - 15;
-            if (Sep(d + 4, '-') && Sep(d + 7, '-')
-                && Digit(d, "2") is { } y1 && Digit(d + 1, Any) is { } y2 && Digit(d + 2, Any) is { } y3 && Digit(d + 3, Any) is { } y4
-                && Digit(d + 5, "01") is { } mo1 && Digit(d + 6, Any) is { } mo2
-                && Digit(d + 8, "0123") is { } d1 && Digit(d + 9, Any) is { } d2)
-            {
-                int yyyy = y1 * 1000 + y2 * 100 + y3 * 10 + y4, mo = mo1 * 10 + mo2, dd = d1 * 10 + d2;
-                if (mo is >= 1 and <= 12 && dd >= 1 && dd <= DateTime.DaysInMonth(yyyy, mo))
-                    date = new DateOnly(yyyy, mo, dd);
-            }
+            int? Year(int at) => Digit(at, "2") is { } y1 && Digit(at + 1, Any) is { } y2
+                && Digit(at + 2, Any) is { } y3 && Digit(at + 3, Any) is { } y4 ? y1 * 1000 + y2 * 100 + y3 * 10 + y4 : null;
+            int? Month(int at) => Digit(at, "01") is { } a && Digit(at + 1, Any) is { } b ? a * 10 + b : null;
+            int? Day(int at) => Digit(at, "0123") is { } a && Digit(at + 1, Any) is { } b ? a * 10 + b : null;
+            static DateOnly? Valid(int? y, int? mo, int? dd) =>
+                y is { } yy && mo is >= 1 and <= 12 && dd >= 1 && dd <= DateTime.DaysInMonth(yy, mo!.Value)
+                    ? new DateOnly(yy, mo.Value, dd!.Value) : null;
+
+            DateOnly? date = null;
+            if (Sep(d + 4, '-') && Sep(d + 7, '-'))
+                date = Valid(Year(d), Month(d + 5), Day(d + 8));
+            else if (Sep(d + 2, '-') && Sep(d + 5, '-'))
+                date = Valid(Year(d + 6), Month(d), Day(d + 3));
 
             if (best == null || dist < best.Value.Reading.Distance)
                 best = (new OsdReading(date, new TimeOnly(hh, mm, ss), dist), i);
@@ -214,15 +291,15 @@ public static class OsdGlyphReader
     }
 
     /// <summary>Distância (Hamming na máscara) da célula a cada modelo, tolerando deslocamento de ±1px.</summary>
-    private static Dictionary<char, int> MaskScores(OsdLayout g, int index, bool[] mask, int w, int h)
+    private static Dictionary<char, int> MaskScores(OsdLayout g, int index, bool[] mask, int w, int h, int font)
     {
-        var scores = Templates.ToDictionary(t => t.Key, _ => int.MaxValue);
+        var scores = TemplatesFor(font).ToDictionary(t => t.Key, _ => int.MaxValue);
         var bits = new bool[Cols * Rows];
         for (var sy = -1; sy <= 1; sy++)
         for (var sx = -1; sx <= 1; sx++)
         {
             SampleMask(g, index, sx, sy, mask, w, h, bits);
-            foreach (var (ch, t) in Templates)
+            foreach (var (ch, t) in TemplatesFor(font))
             {
                 var d = 0;
                 for (var k = 0; k < bits.Length; k++) if (bits[k] != t.Fill[k]) d++;
@@ -259,13 +336,14 @@ public static class OsdGlyphReader
     /// estão escuros. O fundo (demais pixels) é ignorado, então céu branco ou parede não atrapalham.
     /// Retorna null se a célula sair da imagem.
     /// </summary>
-    private static Dictionary<char, int>? ContrastScores(OsdLayout g, int index, byte[] px, int w, int h)
+    private static Dictionary<char, int>? ContrastScores(OsdLayout g, int index, byte[] px, int w, int h, int font)
     {
         if (index < 0) return null;
         var colW = g.Pitch / 8;
         var rowH = g.Height / (double)Rows;
-        var scores = Templates.ToDictionary(t => t.Key, _ => int.MaxValue);
+        var scores = TemplatesFor(font).ToDictionary(t => t.Key, _ => int.MaxValue);
         var level = new int[(Cols + 2) * (Rows + 2)]; // grade com 1 pixel de fonte de borda (contorno externo)
+        var stroke = new bool[level.Length];
 
         for (var sy = -1; sy <= 1; sy++)
         for (var sx = -1; sx <= 1; sx++)
@@ -285,13 +363,36 @@ public static class OsdGlyphReader
                 level[(r + 1) * (Cols + 2) + c + 1] = sum / n;
             }
 
-            foreach (var (ch, t) in Templates)
+            // Limiar claro/escuro da própria célula (meio entre os 15% mais escuros e os 15% mais claros), limitado a
+            // 110..150: a compressão apaga traços finos (barras ~150-170) e clareia o contorno sobre folhagem (~125)
+            var sorted = level.Order().ToArray();
+            var thr = Math.Clamp((sorted[sorted.Length * 15 / 100] + sorted[sorted.Length * 85 / 100]) / 2, 110, 150);
+
+            // Pixel com cara de traço (claro, com escuro a 1-2 pixels dos dois lados): fora do modelo conta como erro.
+            // Sem isso um glifo "contido" em outro empata com ele (o "3" dentro do "8"). Céu branco não tem
+            // escuro em volta, então continua ignorado.
+            const int pw = Cols + 2, ph = Rows + 2;
+            int Lv(int rr, int cc) => rr >= 0 && cc >= 0 && rr < ph && cc < pw ? level[rr * pw + cc] : thr;
+            bool Edge(int rr, int cc, int dr, int dc) =>
+                Lv(rr + dr, cc + dc) < thr || (Lv(rr + dr, cc + dc) >= thr && Lv(rr + 2 * dr, cc + 2 * dc) < thr);
+            for (var k = 0; k < level.Length; k++)
+            {
+                int rr = k / pw, cc = k % pw;
+                // Na borda (fora da célula) nenhum modelo tem traço: a penalidade seria igual para todos e só
+                // inflaria a distância. Com céu claro a faixa entre os contornos de glifos vizinhos cai ali.
+                var border = rr == 0 || cc == 0 || rr == ph - 1 || cc == pw - 1;
+                stroke[k] = !border && level[k] >= thr
+                    && ((Edge(rr, cc, 0, -1) && Edge(rr, cc, 0, 1)) || (Edge(rr, cc, -1, 0) && Edge(rr, cc, 1, 0)));
+            }
+
+            foreach (var (ch, t) in TemplatesFor(font))
             {
                 var d = 0;
                 for (var k = 0; k < level.Length; k++)
                 {
-                    if (t.FillPadded[k] && level[k] < 150) d++;
-                    else if (t.Outline[k] && level[k] > 110) d++;
+                    if (stroke[k] && !t.FillPadded[k]) d++;
+                    else if (t.FillPadded[k] && level[k] < thr) d++;
+                    else if (t.Outline[k] && level[k] >= thr) d++;
                 }
                 if (d < scores[ch]) scores[ch] = d;
             }
@@ -324,8 +425,25 @@ public static class OsdGlyphReader
         }
     }
 
-    // Modelos 7x10 extraídos de gravações reais de NVR Hikvision (720p); '#' = traço branco
-    private static readonly Dictionary<char, Template> Templates = new Dictionary<char, string>
+    // Modelos 7x10 extraídos de gravações reais de NVR Hikvision (720p); '#' = traço branco.
+    // Há duas variantes da fonte entre câmeras; cada caractere pode ter vários modelos e vale o mais próximo.
+    private static IEnumerable<(char Key, Template Value)> TemplatesFor(int font) =>
+        Templates.Where(t => t.Font < 0 || t.Font == font).Select(t => (t.Key, t.Value));
+
+    // Font: 0 = variante original, 1 = variante "cheia", -1 = igual nas duas
+    private static readonly List<(char Key, int Font, Template Value)> Templates = new List<(char, string)>
+    {
+        // Variante "cheia" (hiv00004, 22/10/2026): traços de 2 pixels e barras completas
+        ('1', "...##..|..###..|.####..|...##..|...##..|...##..|...##..|...##..|...##..|.######"),
+        ('2', ".#####.|##...##|.....##|....##.|...##..|..##...|.##....|##.....|##...##|#######"),
+        ('3', ".#####.|##...##|.....##|.....##|..####.|.....##|.....##|.....##|##...##|.#####."),
+        ('4', "....##.|...###.|..####.|.##.##.|##..##.|#######|....##.|....##.|....##.|...####"),
+        ('5', "#######|##.....|##.....|##.....|######.|.....##|.....##|.....##|##...##|.#####."),
+        ('6', "..###..|.##....|##.....|##.....|######.|##...##|##...##|##...##|##...##|.#####."),
+        ('7', "#######|##...##|.....##|.....##|....##.|...##..|..##...|..##...|..##...|..##..."),
+        ('8', ".#####.|##...##|##...##|##...##|.#####.|##...##|##...##|##...##|##...##|.#####."),
+        ('9', ".#####.|##...##|##...##|##...##|.######|.....##|.....##|.....##|....##.|.####.."),
+    }.Select(kv => (kv.Item1, 1, new Template(kv.Item2))).Concat(new Dictionary<char, string>
     {
         ['-'] = ".......|.......|.......|.......|.......|#######|.......|.......|.......|.......",
         ['0'] = "..###..|.##.##.|##...##|##...##|##.#.##|##.#.##|##...##|##...##|.##.##.|..###..",
@@ -339,5 +457,5 @@ public static class OsdGlyphReader
         ['8'] = "..###..|#....##|#....##|#....##|..###..|#....##|#....##|#....##|##...##|..###..",
         ['9'] = "..###..|##...##|##...##|##...##|..###..|.....##|.....##|.....##|....##.|.####..",
         [':'] = ".......|.......|...##..|...##..|.......|.......|.......|...##..|...##..|.......",
-    }.ToDictionary(kv => kv.Key, kv => new Template(kv.Value));
+    }.Select(kv => (kv.Key, kv.Key is '0' or '-' or ':' ? -1 : 0, new Template(kv.Value)))).ToList();
 }

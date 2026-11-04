@@ -57,7 +57,7 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
                 errors.Add((name, "horário do fim do vídeo não lido na imagem (OSD)"));
                 continue;
             }
-            Console.Write($"{Describe(start, 0)} → {Describe(start, span.Value)} ... ");
+            Console.Write($"{Describe(video, start, 0)} → {Describe(video, start, span.Value)} ... ");
 
             var clockSegments = CutWindowCalculator.Calculate(start.StartClock, span.Value);
             if (clockSegments.Count == 0)
@@ -115,7 +115,7 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
             if (failed) ConsoleUi.Error("FALHOU");
             else
             {
-                var desc = string.Join(", ", clockSegments.Select(cs => $"{Describe(start, cs.Start)}-{Describe(start, cs.End, timeOnly: true)}"));
+                var desc = string.Join(", ", clockSegments.Select(cs => $"{Describe(video, start, cs.Start)}-{Describe(video, start, cs.End, timeOnly: true)}"));
                 ConsoleUi.Ok($"{fileSegments.Count} parte(s): {desc}");
                 cut++;
             }
@@ -128,8 +128,8 @@ public class VideoCutter(FfmpegTools ffmpeg, string root)
         ConsoleUi.Info($"Saída: {outDir}");
     }
 
-    private static string Describe(ClockReference start, double elapsed, bool timeOnly = false) =>
-        start.StartDateTime is { } dt && !timeOnly
+    private static string Describe(VideoClock video, ClockReference start, double elapsed, bool timeOnly = false) =>
+        video.StartDateTime is { } dt && !timeOnly
             ? dt.AddSeconds(elapsed).ToString("dd/MM HH:mm:ss")
             : CutWindowCalculator.ClockAt(start.StartClock, elapsed).ToString("HH:mm:ss");
 }
